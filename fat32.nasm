@@ -50,7 +50,10 @@
 ;; Output from newfs_msdos -F32 -b 512:
 ;; BytesPerSec=512 SecPerClust=1 ResSectors=32 FATs=2 Media=0xf0 SecPerTrack=9 Heads=32
 
-	
+;; Constants
+%define DISK_RETRY_COUNT     0x10
+%define ROOT_DIR_BUFFER      0x0200
+
 __oem_id:                  db 		"Syndicate"
 __bytes_per_sector:        dw 		0x0200 ; We read 512 byte sectors
 __sectors_per_cluster:     db 		0x01
@@ -82,7 +85,9 @@ __system_id:               db 		"FAT32   "
 ;; ----------------------------------------------------------
 prepare_fs:
 ;; Computing data location
-	mov cx, WORD[__sectors_per_cluster] ; Get size of a cluster
+	xor cx, cx
+	mov cl, BYTE[__sectors_per_cluster] ; Get size of a cluster
+	xor ah, ah
 	mov al, BYTE[__total_FATs]	    ; Get number of FATs
 	mul WORD[__sectors_per_FAT]	    ; Multiplied by the number of sectors per FAT
 	add ax, WORD[__reserved_sectors]    ; Add the reserved sectors to find the start of the Data Area
@@ -91,7 +96,7 @@ prepare_fs:
 ;; Read computed data area into memory
 	mov ax, WORD[__root_directory_start]
 	call _lba_conv
-	mov bx, 0x0200
+	mov bx, ROOT_DIR_BUFFER
 	call _read_disk_sectors
 
 	ret
@@ -114,7 +119,7 @@ _lba_conv:
 ;; ----------------------------------------------------------
 _read_disk_sectors:
 .restart:
-	mov di, 0x0010		; Tries
+	mov di, DISK_RETRY_COUNT	; Tries
 .loop:
 	push ax
 	push bx

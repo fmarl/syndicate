@@ -35,7 +35,7 @@ printer:
 	push bx
 
 	mov ah, 0x0E 		; BIOS Printing Mode
-	mov bx, 0x00
+	xor bx, bx
 
 .loop:
 	lodsb			; For reference see https://www.i8086.de/asm/8086-88-asm-lodsb.html
@@ -50,6 +50,5 @@ printer:
 	ret
 
 _print_char:
-	mov ah, 0x0E
 	int 0x10
 	ret

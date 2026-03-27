@@ -26,10 +26,7 @@
 
 ;; Try to detect EGA, VGA or VESA BIOS
 detect_bios:
-	push ax
-	push bx
-	push cx
-	push dx
+	pusha
 
 	;; Get EGA Info http://www.ctyme.com/intr/rb-0162.htm
 	mov ah, 0x12
@@ -45,9 +42,9 @@ detect_bios:
 	je _detect_bios_success
 
         ;; Get SuperVGA Info http://www.ctyme.com/intr/rb-0273.htm
-	mov ax, __vesa_info_buffer
+	mov ax, ds
 	mov es, ax
-	xor di, di
+	mov di, __vesa_info_buffer
 	mov ax, 0x4F00
 	int 0x10
 	cmp ax, 0x004F
@@ -61,13 +58,10 @@ _detect_bios_error:
 	jmp $
 
 _detect_bios_success:
-	pop dx
-	pop cx
-	pop bx
-	pop ax
+	popa
 
 	ret
 	
 
 __msg_detect_bios_error: db 0xD, 0xE, `Error: Could not detect BIOS.`, 0x00
-__vesa_info_buffer: db 256
+__vesa_info_buffer: times 256 db 0
