@@ -10,10 +10,10 @@
 ;;        this list of conditions and the following disclaimer in the
 ;;        documentation and/or other materials provided with the distribution.
 ;;
-;; THIS SOFTWARE IS PROVIDED BY <copyright holder> ''AS IS'' AND ANY
+;; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER ''AS IS'' AND ANY
 ;; EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
 ;; WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-;; DISCLAIMED. IN NO EVENT SHALL <copyright holder> BE LIABLE FOR ANY
+;; DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY
 ;; DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
 ;; (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
 ;; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
@@ -30,93 +30,145 @@
 
 ;; Syndicate BOOTLOADER
 ;;
-;; Stage 1
+;; Stage 1. The MBR part loads the rest of stage 1 from the sectors
+;; following the MBR. The rest loads stage 2 and the kernel from the
+;; FAT32 file system on the first partition.
 ;;
-	
+;; Memory layout:
+;;   0x00500  variables
+;;   0x00600  FAT sector buffer
+;;   0x01000  stage 2
+;;   0x07000  stack
+;;   0x07C00  stage 1, MBR
+;;   0x07E00  stage 1, rest
+;;   0x08000  directory buffer, up to 32 KiB
+;;   0x10000  kernel
+;;
+;; Stage 2 is entered at STAGE2_SEG:0 with
+;;   dl  = boot drive
+;;   ecx = kernel size in bytes
+;; in real mode, with A20 enabled.
+
 [BITS 16]
 [ORG 0x7C00]
 
-jmp 0:boot_init
+%ifndef STAGE2_FILE
+%define STAGE2_FILE "STAGE2.BIN"
+%endif
+%ifndef KERNEL_FILE
+%define KERNEL_FILE "KERNEL.BIN"
+%endif
 
-boot_init:
-	cli			; Disable interrupts
+STAGE2_SEG		equ 0x0100
+STAGE2_MAX		equ 0x6000
+KERNEL_SEG		equ 0x1000
+KERNEL_MAX		equ 0x80000
+
+FAT_SEG			equ 0x0060
+FAT_BUF			equ FAT_SEG << 4
+REST_SEG		equ 0x07E0
+DIR_SEG			equ 0x0800
+DIR_BUF			equ DIR_SEG << 4
+
+STAGE1_MAGIC		equ 0x5953
+
+absolute 0x0500
+drive:			resb 1
+sec_per_clus:		resb 1
+fat_lba:		resd 1
+data_lba:		resd 1
+root_cluster:		resd 1
+a20_test:		resb 1
+
+section .text
+
+	jmp 0:start
+
+start:
+	cli
 	xor ax, ax
-	mov ds, ax		; Set data segment
-	mov es, ax		; Set extra segment
-	mov ss, ax		; Set stack segment
-	mov sp, 0x7C00		; Set stack pointer
-	sti			; Enable interrupts
+	mov ds, ax
+	mov es, ax
+	mov ss, ax
+	mov sp, 0x7C00
+	sti
 	cld
 
-	call set_video_mode
+	mov [drive], dl
 
-	mov [__drive_number], dl
-
-	mov si, __msg_bootup
-	call printer
-
-	call enable_a20
-
-	;; We disable this for now. We need more space for the fat32 implementation.
-	;;call detect_bios
-
-	call detect_kern
-
-	mov si, __msg_partfound
-	call printer
-
-	; Load Hadron kernel (HADRON.ELF)
-	call load_hadron
-	jc .boot_failed  ; If carry set, loading failed
-
-	mov si, __msg_hadron_loaded
-	call printer
-
-;; Jumping to kernel
-	push WORD 0x0100
-	push WORD 0x0000
-	retf
-
-.boot_failed:
-	mov si, __msg_boot_failed
-	call printer
-	jmp $  ; Halt on error
-
-;; Bye...
-
-;; ---------------------------------------------------------
-;; ---------------------------------------------------------
-;; ---------------------------------------------------------
-;; ---------------------------------------------------------
-	
-; Includes
-%include "print.nasm"
-%include "fio.nasm"
-;;%include "bios.nasm"
-
-;; ----------------------------------------------------------
-;; Set video mode to 80x25 text mode for compatibility
-;; ----------------------------------------------------------
-set_video_mode:
 	mov ax, 0x0003
 	int 0x10
-	ret
 
-;; ----------------------------------------------------------
-;; Enable A20 line for access to memory above 1MB
-;; Uses Fast A20 Gate method (PS/2 controller)
-;; ----------------------------------------------------------
-enable_a20:
-	in al, 0x92
-	or al, 2
-	out 0x92, al
-	ret
+	mov si, msg_boot
+	call print
 
-__msg_bootup: db 'Syndicate', 0xD, 0xA, 0x00
-__msg_partfound: db 'Loading Stage 2...', 0xD, 0xA, 0x00
-__msg_hadron_loaded: db 'Kernel loaded', 0xD, 0xA, 0x00
-__msg_boot_failed: db 'Boot failed!', 0xD, 0xA, 0x00
-	
-times 510 - ($-$$) db 0x00	; Fill remaining memory
-dw 0xAA55			; Magicnumber which marks this as bootable for BIOS
+	call enable_a20
+	call check_lba
 
+	mov eax, 1
+	mov bx, REST_SEG
+	mov cx, REST_SECTORS
+.load_rest:
+	call read_sector
+	inc eax
+	add bx, 512 >> 4
+	loop .load_rest
+
+	cmp word [rest_magic], STAGE1_MAGIC
+	jne .incomplete
+	jmp rest
+
+.incomplete:
+	mov si, msg_incomplete
+
+fatal:
+	call print
+.halt:
+	cli
+	hlt
+	jmp .halt
+
+%include "print.nasm"
+%include "disk.nasm"
+%include "a20.nasm"
+
+msg_boot:		db "Syndicate", 13, 10, 0
+msg_incomplete:		db "Stage 1 incomplete", 0
+
+%if ($ - $$) > 446
+%error "MBR code exceeds 446 bytes"
+%endif
+
+	times 510 - ($ - $$) db 0
+	dw 0xAA55
+
+rest:
+	call fat_init
+
+	mov si, stage2_name
+	mov bx, STAGE2_SEG
+	mov ecx, STAGE2_MAX
+	call load_file
+
+	mov si, kernel_name
+	mov bx, KERNEL_SEG
+	mov ecx, KERNEL_MAX
+	call load_file
+
+	mov dl, [drive]
+	jmp STAGE2_SEG:0
+
+%include "fat32.nasm"
+%include "fio.nasm"
+
+stage2_name:		fat_name STAGE2_FILE
+kernel_name:		fat_name KERNEL_FILE
+rest_magic:		dw STAGE1_MAGIC
+
+REST_SECTORS		equ ($ - rest + 511) / 512
+
+%if ($ - rest) > DIR_BUF - (REST_SEG << 4)
+%error "stage 1 overlaps the directory buffer"
+%endif
+
+	times REST_SECTORS * 512 - ($ - rest) db 0

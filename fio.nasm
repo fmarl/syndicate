@@ -10,10 +10,10 @@
 ;;        this list of conditions and the following disclaimer in the
 ;;        documentation and/or other materials provided with the distribution.
 ;;
-;; THIS SOFTWARE IS PROVIDED BY <copyright holder> ''AS IS'' AND ANY
+;; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER ''AS IS'' AND ANY
 ;; EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
 ;; WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-;; DISCLAIMED. IN NO EVENT SHALL <copyright holder> BE LIABLE FOR ANY
+;; DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY
 ;; DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
 ;; (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
 ;; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
@@ -21,161 +21,124 @@
 ;; (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 ;; SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-;; fio.inc
-;; Routines to find the kernel on a FAT32 partition
+;; fio.nasm
+;; Loading files from the root directory
 
-%include "fat32.nasm"
+ATTR_DIR_OR_VOLUME	equ 0x18	; also set for long name entries
 
-;; Constants
-%define FILE_ENTRY_SIZE      0x20
-%define FILE_CLUSTER_OFFSET  0x001A
-%define FILE_SIZE_OFFSET     0x001C
-%define KERNEL_SEGMENT       0x0100  ; Linear 0x1000 (Stage 2 bootloader)
-%define KERNEL_CLUSTERS      0x08
-%define HADRON_SEGMENT       0x1000  ; Linear 0x10000 (ELF kernel, 64KB offset)
-%define HADRON_MAX_CLUSTERS  0x80
+struc dirent
+	.name:		resb 11
+	.attr:		resb 1
+	.reserved:	resb 8
+	.cluster_hi:	resw 1
+	.mtime:		resd 1
+	.cluster_lo:	resw 1
+	.size:		resd 1
+endstruc
 
-;; ----------------------------------------------------------
-;; Find the kernel on a FAT32 drive
-;; ----------------------------------------------------------
-detect_kern:
-	pusha
+;; Emit "name.ext" as zero terminated 8.3 directory name
+%macro fat_name 1
+	%strlen %%len %1
+	%assign %%count 0
+	%assign %%ext 0
+	%assign %%i 1
+	%rep %%len
+		%substr %%c %1 %%i
+		%if %%c = '.'
+			%if %%ext || %%count = 0
+				%error invalid 8.3 file name: %1
+			%endif
+			times 8 - %%count db ' '
+			%assign %%ext 1
+			%assign %%count 0
+		%else
+			%if %%c >= 'a' && %%c <= 'z'
+				db %%c - 'a' + 'A'
+			%else
+				db %%c
+			%endif
+			%assign %%count %%count + 1
+			%if %%count > 8 || (%%ext && %%count > 3)
+				%error invalid 8.3 file name: %1
+			%endif
+		%endif
+		%assign %%i %%i + 1
+	%endrep
+	%if %%ext
+		times 3 - %%count db ' '
+	%else
+		times 11 - %%count db ' '
+	%endif
+	db 0
+%endmacro
 
-	call prepare_fs		; Preparing the bootloader to read the FAT32 drive
-	call find_kernel	; Find kernel by name
-	mov WORD[__cluster], dx
-
-;; Preparing kernel location
-	mov ax, KERNEL_SEGMENT	; Location
-	mov es, ax		; Setting extra segment
-	xor bx, bx
-
-;; Reading kernel cluster
-	mov cx, KERNEL_CLUSTERS
-	mov ax, WORD[__cluster]
-	call _lba_conv
-	call _read_disk_sectors
-
-	popa
-	ret
-
-;; ----------------------------------------------------------
-;; Find kernel file by name in root directory
-;; Returns: DX = first cluster of kernel
-;; ----------------------------------------------------------
-find_kernel:
-	mov di, ROOT_DIR_BUFFER
-	mov bx, 16		; Max entries to check
-.loop:
+;; in:  si = 8.3 name, bx = destination segment, ecx = maximum size
+;; out: ecx = file size
+load_file:
 	push bx
-	push di
-	mov si, __kernel_name
-	mov cx, 11		; Compare 11 chars (8.3 filename)
-	repe cmpsb
-	pop di
-	pop bx
-	je .found
-	add di, FILE_ENTRY_SIZE
-	dec bx
-	jnz .loop
-	; Not found - error
-	mov si, __msg_no_kernel
-	call printer
-	jmp $
-.found:
-	mov dx, WORD[di + FILE_CLUSTER_OFFSET]
-	ret
+	push ecx
 
-__kernel_name: db "KERNEL  BIN"
-__msg_no_kernel: db "No kernel!", 0xD, 0xA, 0x00
-__cluster: dw 0x0000
-
-;; ----------------------------------------------------------
-;; Load Hadron ELF kernel
-;; ----------------------------------------------------------
-load_hadron:
+	mov eax, [root_cluster]
+	mov dx, 0xFFFF
+.dir_cluster:
+	mov bx, DIR_SEG
+	call read_cluster
+	mov bp, bx
+	sub bp, DIR_SEG
+	shr bp, 1			; entries read
+	mov di, DIR_BUF
+.scan:
+	cmp byte [di], 0
+	je .not_found
+	test byte [di + dirent.attr], ATTR_DIR_OR_VOLUME
+	jnz .skip
 	pusha
-
-	; Find HADRON.ELF in root directory
-	call find_hadron
-	cmp dx, 0
-	je .error_not_found
-
-	mov WORD[__hadron_cluster], dx
-	mov DWORD[__hadron_size], eax
-
-	; Check if file size is reasonable (max 512KB for now)
-	cmp eax, 0x80000
-	ja .error_too_large
-
-	; Prepare location for Hadron kernel
-	mov ax, HADRON_SEGMENT
-	mov es, ax
-	xor bx, bx
-
-	; Calculate number of clusters needed
-	mov eax, DWORD[__hadron_size]
-	add eax, 511
-	shr eax, 9  ; Divide by 512 (bytes per sector)
-	mov cx, ax
-	cmp cx, HADRON_MAX_CLUSTERS
-	jbe .size_ok
-	mov cx, HADRON_MAX_CLUSTERS
-.size_ok:
-	; Read kernel clusters
-	mov ax, WORD[__hadron_cluster]
-	call _lba_conv
-	call _read_disk_sectors
-
-	popa
-	clc  ; Clear carry = success
-	ret
-
-.error_not_found:
-	popa
-	mov si, __msg_hadron_not_found
-	call printer
-	stc  ; Set carry = error
-	ret
-
-.error_too_large:
-	popa
-	mov si, __msg_hadron_too_large
-	call printer
-	stc  ; Set carry = error
-	ret
-
-__msg_hadron_not_found: db "HADRON.ELF not found!", 0xD, 0xA, 0x00
-__msg_hadron_too_large: db "HADRON.ELF too large!", 0xD, 0xA, 0x00
-
-;; ----------------------------------------------------------
-;; Find Hadron ELF file in root directory
-;; Returns: DX = first cluster, EAX = file size
-;; ----------------------------------------------------------
-find_hadron:
-	mov di, ROOT_DIR_BUFFER
-	mov bx, 32  ; Check more entries
-.loop:
-	push bx
-	push di
-	mov si, __hadron_name
 	mov cx, 11
 	repe cmpsb
-	pop di
-	pop bx
+	popa
 	je .found
-	add di, FILE_ENTRY_SIZE
-	dec bx
-	jnz .loop
-	; Not found - just return with zero
-	xor dx, dx
-	xor eax, eax
-	ret
+.skip:
+	add di, dirent_size
+	dec bp
+	jnz .scan
+	call next_cluster
+	jc .dir_cluster
+.not_found:
+	mov ax, msg_not_found
+	jmp .fail
+
 .found:
-	mov dx, WORD[di + FILE_CLUSTER_OFFSET]
-	mov eax, DWORD[di + FILE_SIZE_OFFSET]
+	pop ecx
+	pop bx
+	mov edx, [di + dirent.size]
+	cmp edx, ecx
+	ja .too_large
+	mov ecx, edx
+	mov ax, [di + dirent.cluster_hi]
+	shl eax, 16
+	mov ax, [di + dirent.cluster_lo]
+	add edx, 511
+	shr edx, 9
+	jz .done
+.load:
+	call read_cluster
+	test dx, dx
+	jz .done
+	call next_cluster
+	jc .load
+	mov ax, msg_corrupt
+	jmp .fail
+.done:
 	ret
 
-__hadron_name: db "HADRON  ELF"
-__hadron_cluster: dw 0x0000
-__hadron_size: dd 0x00000000
+.too_large:
+	mov ax, msg_too_large
+.fail:
+	push ax
+	call print
+	pop si
+	jmp fatal
+
+msg_not_found:		db " not found", 0
+msg_too_large:		db " too large", 0
+msg_corrupt:		db " corrupt", 0

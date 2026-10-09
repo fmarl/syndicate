@@ -21,20 +21,54 @@
 ;; (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 ;; SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-;; print.nasm
-;; Output to the TTY
+;; a20.nasm
+;; Enable the A20 line, trying the BIOS, the fast A20 gate and the
+;; keyboard controller in turn
 
-;; in: si = zero terminated string
-print:
-	push bx
-	mov ah, 0x0E
-	xor bx, bx
-.next:
-	lodsb
-	test al, al
-	jz .done
-	int 0x10
-	jmp .next
+enable_a20:
+	call a20_enabled
+	jnz .done
+
+	mov ax, 0x2401
+	int 0x15
+	call a20_enabled
+	jnz .done
+
+	in al, 0x92
+	or al, 2
+	and al, 0xFE			; bit 0 resets the machine
+	out 0x92, al
+	call a20_enabled
+	jnz .done
+
+	call .kbc_wait
+	mov al, 0xD1			; write output port
+	out 0x64, al
+	call .kbc_wait
+	mov al, 0xDF
+	out 0x60, al
+	call .kbc_wait
+	call a20_enabled
+	jnz .done
+
+	mov si, msg_no_a20
+	jmp fatal
 .done:
-	pop bx
 	ret
+
+.kbc_wait:
+	in al, 0x64
+	test al, 2
+	jnz .kbc_wait
+	ret
+
+;; out: ZF clear if A20 is enabled
+a20_enabled:
+	mov ax, 0xFFFF
+	mov fs, ax
+	mov byte [a20_test], 0
+	mov byte [fs:a20_test + 0x10], 0xFF
+	cmp byte [a20_test], 0xFF
+	ret
+
+msg_no_a20:		db "No A20", 0

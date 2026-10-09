@@ -1,0 +1,9 @@
+(specifications->manifest
+ (list
+  "nasm"
+  "make"
+  "diffutils"
+  "coreutils"
+  "util-linux"
+  "mtools"
+  "qemu-minimal"))

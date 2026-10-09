@@ -1,47 +1,51 @@
-BINDIR = @bindir@
-SRC=$(shell ls boot.nasm)
-OBJ=$(shell ls boot.nasm | sed -e 's/nasm/bin/')
-IMAGE_NAME = test
+NASM		?= nasm
+PREFIX		?= /usr/local
+DATADIR		?= $(PREFIX)/share/syndicate
 
-all: compile
-	@echo "[1] Done."
+STAGE2_FILE	?= STAGE2.BIN
+KERNEL_FILE	?= KERNEL.BIN
 
-compile: ${OBJ}
-	@echo "[0] Compiling loader.bin"
+IMAGE		= test.img
+IMAGE_MB	= 64
+PART_START	= 2048
+PART_OFFSET	= $$(( $(PART_START) * 512 ))
+PART_SIZE	= $$(( $(IMAGE_MB) * 2048 - $(PART_START) ))
 
-${OBJ}: ${SRC}
-	@nasm -f bin $< -o loader.bin
+LOADER		= loader.bin
+SRCS		= boot.nasm print.nasm disk.nasm a20.nasm fat32.nasm fio.nasm
 
-# Build Hadron Stage 2 bootloader
-.PHONY: hadron-stage2
-hadron-stage2:
-	@echo "[*] Building Hadron Stage 2 bootloader"
-	$(MAKE) -C hadron stage2
+# Rebuild when the file names change
+CONFIG		= .build-config
+CONFIG_VAL	= $(STAGE2_FILE) $(KERNEL_FILE)
+$(shell echo '$(CONFIG_VAL)' | cmp -s - $(CONFIG) || echo '$(CONFIG_VAL)' > $(CONFIG))
 
-# Create bootable test image with Syndicate + Hadron
-.PHONY: image
-image: compile hadron-stage2
-	@echo "[*] Creating bootable test image"
-	@rm -f $(IMAGE_NAME).img
-	@dd if=/dev/zero of=$(IMAGE_NAME).img bs=1M count=32
-	@dd if=loader.bin of=$(IMAGE_NAME).img conv=notrunc bs=512 count=1
-	@mformat -i $(IMAGE_NAME).img@@1M -F -v "HADRON" ::
-	@mcopy -i $(IMAGE_NAME).img@@1M hadron/boot/KERNEL.BIN ::/KERNEL.BIN
-	@echo "[*] Test image created: $(IMAGE_NAME).img"
+.PHONY: all image run install clean
 
-# Run test image in QEMU
-.PHONY: run
+all: $(LOADER)
+
+$(LOADER): $(SRCS) $(CONFIG)
+	$(NASM) -f bin -o $@ \
+		-DSTAGE2_FILE='"$(STAGE2_FILE)"' -DKERNEL_FILE='"$(KERNEL_FILE)"' \
+		boot.nasm
+
+image: $(LOADER)
+	@test -n "$(STAGE2)" -a -n "$(KERNEL)" || \
+		{ echo "usage: make image STAGE2=<file> KERNEL=<file>"; exit 1; }
+	rm -f $(IMAGE)
+	dd if=/dev/zero of=$(IMAGE) bs=1M count=$(IMAGE_MB) status=none
+	echo 'start=$(PART_START), type=c, bootable' | sfdisk -q $(IMAGE)
+	mformat -i $(IMAGE)@@$(PART_OFFSET) -F -T $(PART_SIZE) -v SYNDICATE ::
+	mcopy -i $(IMAGE)@@$(PART_OFFSET) $(STAGE2) ::/$(STAGE2_FILE)
+	mcopy -i $(IMAGE)@@$(PART_OFFSET) $(KERNEL) ::/$(KERNEL_FILE)
+	dd if=$(LOADER) of=$(IMAGE) bs=446 count=1 conv=notrunc status=none
+	dd if=$(LOADER) of=$(IMAGE) bs=512 skip=1 seek=1 conv=notrunc status=none
+
 run: image
-	@echo "[*] Starting QEMU"
-	qemu-system-x86_64 -drive file=$(IMAGE_NAME).img,format=raw -m 128M
+	qemu-system-x86_64 -drive file=$(IMAGE),format=raw -m 128M
 
-.PHONY: clean install
-
-install:
-	install -d $(BINDIR)
-	install -t $(BINDIR) loader.bin
+install: $(LOADER)
+	install -d $(DESTDIR)$(DATADIR)
+	install -m 644 $(LOADER) $(DESTDIR)$(DATADIR)
 
 clean:
-	@echo "Cleaning"
-	@rm -rf *.bin *.o *.img
-	@if [ -d hadron ]; then $(MAKE) -C hadron clean; fi
+	rm -f $(LOADER) $(IMAGE) $(CONFIG)

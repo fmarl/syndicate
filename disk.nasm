@@ -1,4 +1,4 @@
-;; Copyright (c) 2021, Florian Buestgens
+;; Copyright (c) 2020, Florian Büstgens
 ;; All rights reserved.
 ;;
 ;; Redistribution and use in source and binary forms, with or without
@@ -10,10 +10,10 @@
 ;;        this list of conditions and the following disclaimer in the
 ;;        documentation and/or other materials provided with the distribution.
 ;;
-;; THIS SOFTWARE IS PROVIDED BY Florian Buestgens ''AS IS'' AND ANY
+;; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER ''AS IS'' AND ANY
 ;; EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
 ;; WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-;; DISCLAIMED. IN NO EVENT SHALL Florian Buestgens BE LIABLE FOR ANY
+;; DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY
 ;; DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
 ;; (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
 ;; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
@@ -21,47 +21,52 @@
 ;; (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 ;; SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-;; bios.nasm
-;; Routine for detecting the BIOS
+;; disk.nasm
+;; Sector access through the INT 13h extensions
 
-;; Try to detect EGA, VGA or VESA BIOS
-detect_bios:
-	pusha
+DISK_RETRIES		equ 4
 
-	;; Get EGA Info http://www.ctyme.com/intr/rb-0162.htm
-	mov ah, 0x12
-	mov bl, 0x10
-	int 0x10
-	cmp bl, 0x10
-	jne _detect_bios_success
-
-	;; Get VGA Info http://www.ctyme.com/intr/rb-0219.htm
-	mov ax, 0x1A00
-	int 0x10
-	cmp al, 0x1A		; Function was supported
-	je _detect_bios_success
-
-        ;; Get SuperVGA Info http://www.ctyme.com/intr/rb-0273.htm
-	mov ax, ds
-	mov es, ax
-	mov di, __vesa_info_buffer
-	mov ax, 0x4F00
-	int 0x10
-	cmp ax, 0x004F
-	je _detect_bios_success
-	
-
-_detect_bios_error:
-	mov si, __msg_detect_bios_error
-	call printer
-	
-	jmp $
-
-_detect_bios_success:
-	popa
-
+check_lba:
+	mov ah, 0x41
+	mov bx, 0x55AA
+	mov dl, [drive]
+	int 0x13
+	jc .fail
+	cmp bx, 0xAA55
+	jne .fail
 	ret
-	
+.fail:
+	mov si, msg_no_lba
+	jmp fatal
 
-__msg_detect_bios_error: db 0xD, 0xE, `Error: Could not detect BIOS.`, 0x00
-__vesa_info_buffer: times 256 db 0
+;; in: eax = LBA, bx = destination segment
+read_sector:
+	pushad
+	mov bp, sp
+	mov di, DISK_RETRIES
+.retry:
+	mov eax, [bp + 28]		; eax as saved by pushad
+	push dword 0
+	push eax
+	push bx
+	push word 0
+	push word 1
+	push word 16
+	mov si, sp			; disk address packet
+	mov ah, 0x42
+	mov dl, [drive]
+	int 0x13
+	mov sp, bp
+	jnc .done
+	xor ah, ah
+	int 0x13
+	dec di
+	jnz .retry
+	mov si, msg_disk_error
+	jmp fatal
+.done:
+	popad
+	ret
+
+msg_no_lba:		db "No LBA", 0
+msg_disk_error:		db "Disk error", 0
